@@ -1,137 +1,100 @@
 extern crate libc;
+use libc::c_int;
 extern crate nix;
+use nix::sys::socket;
 
-use libc::{
-    c_int,
-    getpid,
-    setsockopt,
-};
-use nix::{Error, Errno};
-use nix::sys::socket::{
-    AddressFamily, 
-    SockAddr, 
-    SockFlag, 
-    SockType, 
-};
+type Result<T> = std::result::Result<T, nix::Error>;
 
-use nix::sys::socket::{
-    bind,
-    recvmsg,
-    sendmsg,
-    socket,
-};
-
-#[repr(C)]
 #[derive(Debug)]
-pub enum NetlinkSockOpt {
-    AddMembership = 1,
-    DropMembership = 2,
-    PktInfo = 3,
-    BroadcastError = 4,
-    NoEnobufs = 5,
-}
+pub struct Socket(c_int);
 
-fn setsockopt_int(
-    fd: c_int,
-    level: c_int, 
-    option: c_int, 
-    val: c_int
-) -> Result<(), nix::Error> {
-    use std::mem;
-    let res = unsafe {
-        setsockopt(
-            fd, 
-            level, 
-            option as c_int,
-            mem::transmute(&val), 
-            mem::size_of::<c_int>() as u32,
-        )
-    };
+impl Socket {
+    fn __new() -> Result<Self> {
+        let fd = socket::socket(
+            nix::sys::socket::AddressFamily::Netlink,
+            nix::sys::socket::SockType::Raw,
+            nix::sys::socket::SockFlag::empty(),
+            libc::NETLINK_USERSOCK,
+        )?;
 
-    if res == -1 {
-        return Err(nix::Error::last());
+        let pid = unsafe { libc::getpid() };
+
+        socket::bind(fd, &nix::sys::socket::SockAddr::new_netlink(pid as u32, 0))?;
+
+        Ok(Socket(fd))
     }
 
-    Ok(())
-}
+    pub fn new() -> Result<Self> {
+        let s = Self::__new()?;
+        s.setsockopt_int(270, libc::NETLINK_ADD_MEMBERSHIP, 22)?;
+        Ok(s)
+    }
 
-fn nl_open() -> Result<i32, nix::Error> {
-    let sock = socket(
-        AddressFamily::Netlink,
-        SockType::Raw,
-        SockFlag::empty(),
-        libc::NETLINK_USERSOCK,
-    )?; 
+    fn setsockopt_int(&self, level: c_int, option: c_int, val: c_int) -> Result<()> {
+        use std::mem;
+        let res = unsafe {
+            libc::setsockopt(
+                self.0,
+                level,
+                option as c_int,
+                mem::transmute(&val),
+                mem::size_of::<c_int>() as u32,
+            )
+        };
 
-    let pid;
-    unsafe {
-        pid = getpid();
-    };
+        if res == -1 {
+            return Err(nix::Error::last());
+        }
 
-    bind(
-        sock, 
-        &SockAddr::new_netlink(pid as u32, 0)
-    )?;
+        Ok(())
+    }
 
-    setsockopt_int(sock, 270, libc::NETLINK_ADD_MEMBERSHIP, 22)?;
+    fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        socket::recvmsg::<()>(
+            self.0,
+            &[nix::sys::uio::IoVec::from_mut_slice(&mut buf[..])],
+            None,
+            nix::sys::socket::MsgFlags::empty(),
+        ).map(|r| r.bytes)
+    }
 
-    return Ok(sock);
-}
+    fn send(&self, _: Option<u16>, buf: &[u8]) -> Result<()> {
+        socket::sendmsg(
+            self.0,
+            &[nix::sys::uio::IoVec::from_slice(&buf[..])],
+            &[],
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        ).map(|_| ())
+    }
 
-fn nl_recv(sock: i32, count: u32) -> Result<(), nix::Error> {
-    let mut buf = [0u8; 1024];
-    let mut cmsg : nix::sys::socket::CmsgSpace<()> = nix::sys::socket::CmsgSpace::new();
-
-    println!("[{}]", count);
-    recvmsg(
-        sock,
-        &[nix::sys::uio::IoVec::from_mut_slice(&mut buf[..])],
-        Some(&mut cmsg),
-        nix::sys::socket::MsgFlags::empty(),
-    )?;
-
-    return match nl_send(sock, buf) {
-        Ok(_) => Ok(()),
-        Err(err) => Err(err),
-    };
-}
-
-fn nl_send(sock: i32, buf: [u8; 1024]) -> Result<usize, nix::Error > {
-    return sendmsg(
-        sock,
-        &[nix::sys::uio::IoVec::from_slice(&buf[..])],
-        &[],
-        nix::sys::socket::MsgFlags::empty(),
-        None,
-    );
+    //fn close(&self) -> Result<()> {
+    //    return socket::shutdown(self.0, nix::sys::socket::Shutdown::Both);
+    //}
 }
 
 fn main() {
-    let sk;
-    let sock_res = nl_open();
-    match sock_res {
-        Ok(sock) => {
-            println!("sock {}", sock);
-            sk = sock;
-        },
-        Err(Error::Sys(Errno::EPERM)) => {
-            println!("Please run as root.");
-            return;
-        },
-        Err(err) => {
-            println!("error {}", err);
-            return;
-        },
-    }
+    use std::sync::Arc;
+    let sk = Arc::new(Socket::new().unwrap());
+    let sk1 = sk.clone();
 
-    let mut count = 0;
-    loop {
-        match nl_recv(sk, count) {
-            Ok(_) => {count = count + 1}
-            Err(e) => {
-                println!("error {}", e);
-                return;
-            }
-        };
+    use std::sync::mpsc;
+    let (tx, rx): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
+    use std::thread;
+    thread::spawn(move || {
+        let mut count = 0;
+        let mut buf = vec![0u8; 1024];
+        loop {
+            print!("[{}] ", count);
+            let len = sk.recv(&mut buf).unwrap();
+            buf.truncate(len);
+            count += 1;
+            println!("{} B: {:?}", len, &buf[0x10..]);
+            tx.send(buf.clone()).unwrap();
+        }
+    });
+
+    for m in rx.iter() {
+        sk1.send(None, &m[..]).unwrap();
     }
 }
